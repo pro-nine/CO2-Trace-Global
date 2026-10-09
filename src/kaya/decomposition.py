@@ -1,199 +1,73 @@
+"""Path-aware Kaya LMDI and measurement-noise sensitivity.
+
+The additive Kaya identity decomposes CO2 into population, affluence,
+energy-intensity and carbon-intensity effects. `chain_lmdi` decomposes each
+adjacent year and sums it, preserving path-dependent log-mean weights.
+`driver_stability` perturbs the observed endpoint inputs on the log scale; its
+percentiles are a sensitivity analysis, not a sampling confidence interval.
 """
-Kaya Identity Decomposition
-==============================
-The Kaya Identity (Yoichi Kaya, 1990) expresses CO2 emissions as a product
-of four factors:
-
-    CO2 = P * (G/P) * (E/G) * (C/E)
-
-Where:
-    P    = Population
-    G/P  = GDP per capita (affluence / prosperity)
-    E/G  = Energy intensity of GDP (how much energy per unit of economic output)
-    C/E  = Carbon intensity of energy (how dirty is the energy mix)
-
-This is an accounting identity (true by definition, not a behavioural claim),
-which means any change in CO2 can be EXACTLY decomposed into contributions
-from each factor. It does NOT tell you WHY each factor changed (that requires
-causal analysis), but it tells you WHERE change came from -- which is often
-deeply counterintuitive.
-
-DECOMPOSITION METHOD: Log-Mean Divisia Index (LMDI), additive form.
-  - Chosen over simple ratio decomposition because LMDI produces no residual
-    term (the decomposition is complete: all effects sum to the total CO2
-    change) and handles zero/negative values more gracefully.
-  - LMDI additive decomposition (Ang, 2005):
-    ΔTCO2 = Δ_pop + Δ_aff + Δ_int + Δ_mix
-    where each term is:
-    Δ_factor = [L(C_T, C_0)] * ln(factor_T / factor_0)
-    and L(x,y) = (x-y) / (ln(x) - ln(y)) is the log-mean weight.
-
-WHY THIS MATTERS (the humanly interesting question):
-When we say "Germany reduced its CO2 by X% since 1990," how much of that is:
-  (a) actual clean energy transition (C/E fell)
-  (b) becoming a more energy-efficient economy (E/G fell)
-  (c) a declining manufacturing base / economic structure shift (G/P grew less
-      or manufacturing share fell -- captured partially in E/G)
-  (d) demographic stagnation (population barely grew, so P effect is small)
-
-A country can achieve massive "CO2 reduction" entirely from (b), (c), (d)
-while actually INCREASING its per-unit-energy carbon intensity or barely
-building any renewables. The headline CO2 number masks all of this.
-"""
-from dataclasses import dataclass
-from typing import Optional
+from __future__ import annotations
 import numpy as np
 import pandas as pd
+FACTORS=["population","gdp_per_capita","energy_per_gdp","co2_per_energy"]
+EFFECTS=["delta_population","delta_affluence","delta_intensity","delta_carbon_mix"]
+REDUCERS=["delta_intensity","delta_carbon_mix"]
 
+def log_mean(a,b):
+    a,b=np.asarray(a,float),np.asarray(b,float)
+    with np.errstate(divide="ignore",invalid="ignore"):
+        return np.where(np.isclose(a,b,rtol=1e-12,atol=0),a,(a-b)/(np.log(a)-np.log(b)))
 
-@dataclass
-class KayaDecomp:
-    iso_code: str
-    country: str
-    year_start: int
-    year_end: int
-    co2_start: float
-    co2_end: float
-    co2_change: float          # absolute change Mt CO2
-    co2_pct_change: float      # percentage change
-    delta_population: float    # Mt CO2 change attributable to population growth
-    delta_affluence: float     # ... to GDP/capita growth (income effect)
-    delta_intensity: float     # ... to energy intensity of GDP (efficiency)
-    delta_carbon_mix: float    # ... to carbon intensity of energy (fuel switching)
-    check_residual: float      # should be near zero (LMDI completeness check)
+def lmdi_effects(c0,c1,f0,f1):
+    effects=log_mean(c1,c0)[:,None]*(np.log(f1)-np.log(f0))
+    return effects,(c1-c0)-effects.sum(axis=1)
 
-    @property
-    def dominant_driver(self) -> str:
-        contributions = {
-            "population": abs(self.delta_population),
-            "affluence": abs(self.delta_affluence),
-            "energy_efficiency": abs(self.delta_intensity),
-            "fuel_switch": abs(self.delta_carbon_mix),
-        }
-        return max(contributions, key=contributions.get)
+def eligible_countries(panel,year_start,year_end):
+    sub=panel[panel.year.between(year_start,year_end)]; cols=["co2",*FACTORS]
+    good=sub.groupby("iso_code")[cols].apply(lambda g: bool((g>0).all().all()))
+    n=sub.groupby("iso_code").year.nunique()
+    return sorted(good[good&(n==year_end-year_start+1)].index)
 
-    @property
-    def reduction_breakdown_pct(self) -> dict:
-        """
-        For countries with any net CO2 change: signed contribution of each
-        factor as a % of the total ABSOLUTE change, signed so negative =
-        CO2-reducing contribution and positive = CO2-increasing contribution.
-        Uses the total ABSOLUTE change as denominator so values can exceed
-        100% in magnitude (when opposing forces more than cancel).
+def chain_lmdi(panel,year_start=1990,year_end=2022):
+    sub=panel[panel.iso_code.isin(eligible_countries(panel,year_start,year_end))&panel.year.between(year_start,year_end)]
+    rows=[]
+    for iso,g in sub.sort_values("year").groupby("iso_code"):
+        c=g.co2.to_numpy(float); f=g[FACTORS].to_numpy(float); e,r=lmdi_effects(c[:-1],c[1:],f[:-1],f[1:])
+        x=pd.DataFrame(e,columns=EFFECTS); x.insert(0,"year",g.year.to_numpy()[1:]); x.insert(0,"iso_code",iso)
+        x["delta_co2"]=c[1:]-c[:-1]; x["residual"]=r; rows.append(x)
+    return pd.concat(rows,ignore_index=True)
 
-        Interpretation example for Germany (-36.7% net):
-          affluence = +150% means income growth ADDED 1.5x the net reduction
-          efficiency = -187% means efficiency REMOVED 1.87x the net reduction
-          Net = -37% -> efficiency and fuel switching overcame affluence uplift
-        """
-        if abs(self.co2_change) < 1e-6:
-            return {}
-        denom = abs(self.co2_change)
-        return {
-            "fuel_switch": round(self.delta_carbon_mix / denom * 100, 1),
-            "energy_efficiency": round(self.delta_intensity / denom * 100, 1),
-            "affluence": round(self.delta_affluence / denom * 100, 1),
-            "population": round(self.delta_population / denom * 100, 1),
-        }
+def endpoint_lmdi(panel,year_start=1990,year_end=2022):
+    a=panel[panel.year==year_start].set_index("iso_code"); b=panel[panel.year==year_end].set_index("iso_code")
+    ix=sorted(set(a.index)&set(b.index)); cols=["co2",*FACTORS]; a,b=a.loc[ix],b.loc[ix]
+    ok=((a[cols]>0)&(b[cols]>0)).all(axis=1)&a[cols].notna().all(axis=1)&b[cols].notna().all(axis=1); a,b=a[ok],b[ok]
+    e,r=lmdi_effects(a.co2.to_numpy(float),b.co2.to_numpy(float),a[FACTORS].to_numpy(float),b[FACTORS].to_numpy(float))
+    out=pd.DataFrame(e,columns=EFFECTS,index=a.index); out.insert(0,"country",a.country)
+    out["co2_start"],out["co2_end"]=a.co2,b.co2; out["co2_change_mt"]=b.co2-a.co2
+    out["co2_pct_change"]=out.co2_change_mt/a.co2*100; out["residual"]=r
+    return out.reset_index()
 
+def dominant(df,columns=EFFECTS): return df[list(columns)].abs().idxmax(axis=1)
+def main_reducer(df): return df[REDUCERS].idxmin(axis=1)
 
-def _log_mean(x: float, y: float) -> float:
-    """Log-mean weight for LMDI. Handles x==y exactly."""
-    if abs(x - y) < 1e-12:
-        return x
-    if x <= 0 or y <= 0:
-        return np.nan
-    return (x - y) / (np.log(x) - np.log(y))
+def driver_stability(panel,year_start=1990,year_end=2022,n_draws=300,noise_sd=.03,seed=0):
+    base=endpoint_lmdi(panel,year_start,year_end); cols=["co2",*FACTORS]
+    a=panel[panel.year==year_start].set_index("iso_code").loc[base.iso_code]; b=panel[panel.year==year_end].set_index("iso_code").loc[base.iso_code]
+    rng=np.random.default_rng(seed); n=len(base); d0,red0=dominant(base),main_reducer(base); kd=np.zeros(n); kr=np.zeros(n); draws=np.zeros((n_draws,n,4))
+    for i in range(n_draws):
+        f0=a[cols].to_numpy(float)*np.exp(rng.normal(0,noise_sd,(n,5))); f1=b[cols].to_numpy(float)*np.exp(rng.normal(0,noise_sd,(n,5)))
+        e,_=lmdi_effects(f0[:,0],f1[:,0],f0[:,1:],f1[:,1:]); draws[i]=e; tmp=pd.DataFrame(e,columns=EFFECTS)
+        kd+=dominant(tmp).to_numpy()==d0.to_numpy(); kr+=main_reducer(tmp).to_numpy()==red0.to_numpy()
+    out=base[["iso_code","country","co2_pct_change"]].copy(); out["dominant_driver"],out["main_reducer"]=d0,red0
+    out["p_dominant_holds"],out["p_main_reducer_holds"]=kd/n_draws,kr/n_draws
+    for j,name in enumerate(EFFECTS): out[f"{name}_p05"]=np.percentile(draws[:,:,j],5,axis=0); out[f"{name}_p95"]=np.percentile(draws[:,:,j],95,axis=0)
+    return out
 
-
-def _lmdi_additive(co2_0: float, co2_T: float,
-                    p_0: float, p_T: float,
-                    gpop_0: float, gpop_T: float,
-                    egdp_0: float, egdp_T: float,
-                    ce_0: float, ce_T: float) -> tuple:
-    """
-    LMDI additive decomposition.
-    All inputs must be positive; NaN propagates.
-    Returns (delta_pop, delta_aff, delta_int, delta_mix, residual).
-    """
-    if any(v is None or np.isnan(v) or v <= 0 for v in
-           [co2_0, co2_T, p_0, p_T, gpop_0, gpop_T, egdp_0, egdp_T, ce_0, ce_T]):
-        return (np.nan,) * 5
-
-    L = _log_mean(co2_T, co2_0)
-    d_pop = L * np.log(p_T / p_0)
-    d_aff = L * np.log(gpop_T / gpop_0)
-    d_int = L * np.log(egdp_T / egdp_0)
-    d_mix = L * np.log(ce_T / ce_0)
-    residual = (co2_T - co2_0) - (d_pop + d_aff + d_int + d_mix)
-    return d_pop, d_aff, d_int, d_mix, residual
-
-
-def decompose_country(df: pd.DataFrame, iso: str,
-                       year_start: int = 1990, year_end: int = 2022) -> Optional[KayaDecomp]:
-    sub = df[(df["iso_code"] == iso) & (df["year"].isin([year_start, year_end]))].copy()
-    if len(sub) < 2:
-        return None
-
-    r0 = sub[sub["year"] == year_start].iloc[0]
-    rT = sub[sub["year"] == year_end].iloc[0]
-
-    needed = ["co2", "population", "gdp_per_capita", "energy_per_gdp", "co2_per_energy"]
-    if any(pd.isna(r0[c]) or pd.isna(rT[c]) or r0[c] <= 0 or rT[c] <= 0 for c in needed):
-        return None
-
-    d_pop, d_aff, d_int, d_mix, resid = _lmdi_additive(
-        r0["co2"], rT["co2"],
-        r0["population"], rT["population"],
-        r0["gdp_per_capita"], rT["gdp_per_capita"],
-        r0["energy_per_gdp"], rT["energy_per_gdp"],
-        r0["co2_per_energy"], rT["co2_per_energy"],
-    )
-    return KayaDecomp(
-        iso_code=iso, country=r0["country"],
-        year_start=year_start, year_end=year_end,
-        co2_start=r0["co2"], co2_end=rT["co2"],
-        co2_change=rT["co2"] - r0["co2"],
-        co2_pct_change=(rT["co2"] - r0["co2"]) / r0["co2"] * 100,
-        delta_population=d_pop, delta_affluence=d_aff,
-        delta_intensity=d_int, delta_carbon_mix=d_mix,
-        check_residual=resid,
-    )
-
-
-def decompose_all(df: pd.DataFrame, year_start: int = 1990,
-                   year_end: int = 2022) -> pd.DataFrame:
-    results = []
-    for iso in df["iso_code"].unique():
-        d = decompose_country(df, iso, year_start, year_end)
-        if d is not None:
-            results.append({
-                "iso_code": d.iso_code, "country": d.country,
-                "co2_start": d.co2_start, "co2_end": d.co2_end,
-                "co2_change_mt": d.co2_change, "co2_pct_change": d.co2_pct_change,
-                "delta_population": d.delta_population, "delta_affluence": d.delta_affluence,
-                "delta_intensity": d.delta_intensity, "delta_carbon_mix": d.delta_carbon_mix,
-                "check_residual": d.check_residual, "dominant_driver": d.dominant_driver,
-            })
-    return pd.DataFrame(results)
-
-
-if __name__ == "__main__":
-    from src.data.loader import build_panel, load_raw
-    co2_raw, energy_raw = load_raw()
-    panel = build_panel(co2_raw, energy_raw)
-    decomp = decompose_all(panel)
-
-    print(f"Decomposed {len(decomp)} countries.")
-    print(f"Max LMDI residual (should be ~0): {decomp['check_residual'].abs().max():.4f}")
-
-    reducers = decomp[decomp["co2_change_mt"] < 0].sort_values("co2_pct_change")
-    print(f"\nCountries that REDUCED emissions 1990-2022: {len(reducers)}")
-    print("\nTop 10 reducers (% change):")
-    for _, row in reducers.head(10).iterrows():
-        d = decompose_country(panel, row["iso_code"])
-        bkd = d.reduction_breakdown_pct
-        print(f"  {row['country']:25s} {row['co2_pct_change']:+6.1f}%  "
-              f"fuel_switch={bkd.get('fuel_switch',0):.0f}%  "
-              f"efficiency={bkd.get('energy_efficiency',0):.0f}%  "
-              f"affluence={bkd.get('affluence',0):.0f}%")
+def efficiency_led_share(panel,n_draws=300,noise_sd=.03,seed=1):
+    base=endpoint_lmdi(panel); red=base[base.co2_change_mt<0]; cols=["co2",*FACTORS]
+    a=panel[panel.year==1990].set_index("iso_code").loc[red.iso_code]; b=panel[panel.year==2022].set_index("iso_code").loc[red.iso_code]
+    rng=np.random.default_rng(seed); shares=[]
+    for _ in range(n_draws):
+        f0=a[cols].to_numpy(float)*np.exp(rng.normal(0,noise_sd,(len(red),5))); f1=b[cols].to_numpy(float)*np.exp(rng.normal(0,noise_sd,(len(red),5)))
+        e,_=lmdi_effects(f0[:,0],f1[:,0],f0[:,1:],f1[:,1:]); still=(f1[:,0]-f0[:,0])<0; shares.append(float((e[still,2]<e[still,3]).mean()))
+    return {"n_reducers":len(red),"efficiency_led_share":float((main_reducer(red)=="delta_intensity").mean()),"p05":float(np.percentile(shares,5)),"p95":float(np.percentile(shares,95))}
