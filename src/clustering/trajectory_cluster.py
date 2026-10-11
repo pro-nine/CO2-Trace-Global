@@ -1,116 +1,54 @@
+"""Robust log-trajectory clustering and co-assignment stability.
+
+Countries are compared by RMS Euclidean distance on log(CO2pc / base-year CO2pc).
+Near-zero base-year emitters are excluded explicitly because their ratios are
+not meaningful. Hierarchical clustering is accompanied by moving-block bootstrap
+co-assignment: the latter shows which pairwise stories persist when years change.
 """
-Country CO2 Trajectory Clustering
-=====================================
-K-means clustering on per-capita CO2 trajectories (1990-2022), normalized
-to each country's 1990 baseline (index = 1.0 in 1990). This clusters
-countries by the SHAPE of their emissions path — not by income group,
-region, or political bloc, which is the conventional grouping.
-
-The key question: do countries' actual trajectories cluster in ways that
-are more or less informative than the usual political/income groupings?
-
-Pre-processing:
-  - Interpolate minor missing years (≤3 consecutive) within each series
-  - Drop countries with >5 missing years after interpolation
-  - Normalize to 1990=1.0 so clustering is on trajectory SHAPE,
-    not on absolute emission level (otherwise China's high absolute
-    level would dominate purely on scale)
-
-Cluster labeling: after fitting, each cluster is described by its
-median trajectory and labeled by the dominant pattern:
-  "Sustained reducers"   -- consistently below 1990 and trending down
-  "Peak and decline"     -- rose then fell, now below or near 1990
-  "Growth then plateau"  -- rose fast, now leveling off
-  "Rapid growth"         -- strong continuous increase throughout
-  "Collapse-recover"     -- sharp dip (often post-Soviet) then recovery
-"""
-from typing import Dict, List
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import silhouette_score
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import pdist, squareform
+from sklearn.metrics import silhouette_samples, silhouette_score
 
-YEAR_COLS = list(range(1990, 2023))
-N_CLUSTERS_DEFAULT = 5
-RANDOM_STATE = 42
+MIN_START_CO2_PC=.1
 
+def log_trajectories(panel,base_year=1990,min_start=MIN_START_CO2_PC):
+    wide=panel.pivot(index="iso_code",columns="year",values="co2_per_capita").sort_index(axis=1)
+    complete=wide.dropna(); start=complete[base_year]; keep=(start>=min_start)&(complete>0).all(axis=1)
+    excluded=sorted(set(wide.index)-set(complete.index[keep])); return np.log(complete[keep].div(start[keep],axis=0)),excluded
 
-def build_trajectory_matrix(panel: pd.DataFrame) -> pd.DataFrame:
-    """
-    Returns a wide-format DataFrame: rows = countries, columns = years.
-    Values are the per-capita CO2 INDEX relative to 1990 (1990=1.0).
-    """
-    wide = panel.pivot_table(index="iso_code", columns="year",
-                              values="co2_per_capita", aggfunc="mean")
-    available_years = [y for y in YEAR_COLS if y in wide.columns]
-    wide = wide[available_years]
+def rms_distance(L):
+    d=squareform(pdist(L.to_numpy(),"euclidean"))/np.sqrt(L.shape[1]); return pd.DataFrame(d,index=L.index,columns=L.index)
 
-    # Normalize to 1990 baseline
-    if 1990 in wide.columns:
-        wide = wide.div(wide[1990], axis=0)
+def cluster_labels(D,k): return fcluster(linkage(squareform(D,checks=False),method="average"),k,criterion="maxclust")-1
 
-    # Interpolate within-series gaps (forward then backward for edge years)
-    wide = wide.interpolate(axis=1, limit=3, limit_direction="both")
+def choose_k(D,k_range=(3,8)):
+    scores={k:float(silhouette_score(D,cluster_labels(D,k),metric="precomputed")) for k in range(k_range[0],k_range[1]+1)}
+    best=max(scores,key=scores.get); return best,scores
 
-    # Drop countries with too many missing years
-    wide = wide.dropna(thresh=len(available_years) - 5)
-    return wide
+def _block_cols(n,block,rng):
+    starts=rng.integers(0,n-block+1,size=int(np.ceil(n/block))); return np.concatenate([np.arange(s,s+block) for s in starts])[:n]
 
+def consensus(L,k,n_boot=200,block=5,seed=0):
+    rng=np.random.default_rng(seed); X=L.to_numpy(); n=len(L); co=np.zeros((n,n))
+    for _ in range(n_boot):
+        cols=_block_cols(X.shape[1],min(block,X.shape[1]),rng); D=squareform(pdist(X[:,cols]))/np.sqrt(len(cols)); lab=cluster_labels(D,k); co+=(lab[:,None]==lab[None,:])
+    return pd.DataFrame(co/n_boot,index=L.index,columns=L.index)
 
-def find_optimal_k(X: np.ndarray, k_range=(3, 8)) -> int:
-    """Find k with best silhouette score."""
-    best_k, best_score = k_range[0], -1
-    for k in range(k_range[0], k_range[1] + 1):
-        labels = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=20).fit_predict(X)
-        score = silhouette_score(X, labels)
-        if score > best_score:
-            best_k, best_score = k, score
-    return best_k
+def compare(focal,peers,D,C):
+    rows=[{"peer":p,"distance":float(D.loc[focal,p]),"co_assignment":float(C.loc[focal,p])} for p in peers if p in D.index and p!=focal]
+    return pd.DataFrame(rows).sort_values("distance").reset_index(drop=True)
 
+def boundary_countries(D,labels,index,threshold=.1):
+    s=silhouette_samples(D,labels,metric="precomputed"); return [i for i,v in zip(index,s) if v<threshold]
 
-def cluster_trajectories(panel: pd.DataFrame, n_clusters: int = None) -> pd.DataFrame:
-    wide = build_trajectory_matrix(panel)
-    X = wide.values
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X.T).T   # scale each year-feature, not each country
-
-    if n_clusters is None:
-        n_clusters = find_optimal_k(X_scaled)
-
-    km = KMeans(n_clusters=n_clusters, random_state=RANDOM_STATE, n_init=20)
-    labels = km.fit_predict(X_scaled)
-
-    result = pd.DataFrame({"iso_code": wide.index, "cluster": labels})
-
-    # Add country names from panel
-    names = panel[["iso_code", "country"]].drop_duplicates()
-    result = result.merge(names, on="iso_code", how="left")
-
-    # Add median trajectory per cluster for labeling
-    wide_labeled = wide.copy()
-    wide_labeled["cluster"] = labels
-    cluster_medians = wide_labeled.groupby("cluster").median()
-
-    # Add some characterization metrics
-    result["co2_index_2000"] = wide.reindex(result["iso_code"])[[2000]].values.flatten() if 2000 in wide.columns else np.nan
-    result["co2_index_2010"] = wide.reindex(result["iso_code"])[[2010]].values.flatten() if 2010 in wide.columns else np.nan
-    result["co2_index_2022"] = wide.reindex(result["iso_code"])[[2022]].values.flatten() if 2022 in wide.columns else np.nan
-
-    return result, cluster_medians, n_clusters
-
-
-if __name__ == "__main__":
-    from src.data.loader import build_panel, load_raw
-    co2_raw, energy_raw = load_raw()
-    panel = build_panel(co2_raw, energy_raw)
-
-    result, medians, n_k = cluster_trajectories(panel)
-    print(f"Optimal k: {n_k}  |  Countries clustered: {len(result)}")
-    print("\nCluster median CO2 index (1990=1.0):")
-    print(medians[[1990, 2000, 2010, 2022]].round(2).to_string())
-    print("\nCluster membership samples:")
-    for c in sorted(result["cluster"].unique()):
-        members = result[result["cluster"] == c]["country"].tolist()
-        print(f"\nCluster {c} ({len(members)} countries):")
-        print("  " + ", ".join(members[:12]) + ("..." if len(members) > 12 else ""))
+def cluster_summary(L,labels,years=(2000,2010,2022)):
+    med=np.exp(L.groupby(labels).median()); out=med[list(years)].copy(); out["n"]=pd.Series(labels).value_counts().sort_index().values
+    def shape(row):
+        end,mid=row[years[-1]],row[years[1]]
+        if end>1.25:return "growth"
+        if end<.75 and row[years[0]]<.8:return "early drop"
+        if end<.75:return "late decline"
+        return "plateau" if mid>.9 else "decline then plateau"
+    out["shape"]=out.apply(shape,axis=1); return out
