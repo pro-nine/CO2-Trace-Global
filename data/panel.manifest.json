@@ -1,0 +1,12 @@
+{
+  "sha256": "2b29d86f403e8585cc298c3dbd98b3f6a2a6669f5212b10e8f1f587ab8b7d154",
+  "rows": 5346,
+  "countries": 162,
+  "year_min": 1990,
+  "year_max": 2022,
+  "sources": [
+    "https://raw.githubusercontent.com/owid/co2-data/master/owid-co2-data.csv",
+    "https://raw.githubusercontent.com/owid/energy-data/master/owid-energy-data.csv"
+  ],
+  "note": "Snapshot committed to this repository."
+}
