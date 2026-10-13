@@ -1,328 +1,181 @@
+"""Run the full analysis offline and write the report, tables and figures.
+
+    python -m scripts.run_analysis              # full run, about a minute
+    python -m scripts.run_analysis --fast       # skips placebo inference
+    python -m scripts.run_analysis --refresh    # re-download OWID first (explicit)
+
+Every number in outputs/analysis_report.md is computed in this run.
 """
-Main entry point: python3 -m scripts.run_analysis
-Produces outputs/analysis_report.md and outputs/figures/*.png
-"""
-from pathlib import Path
+from __future__ import annotations
+
+import argparse
+import json
+import sys
 import warnings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-warnings.filterwarnings("ignore", category=FutureWarning)
 
-from src.data.loader import build_panel, load_raw
-from src.kaya.decomposition import decompose_all, decompose_country
-from src.decoupling.classifier import classify_all, DecouplingState
-from src.clustering.trajectory_cluster import cluster_trajectories, build_trajectory_matrix
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+warnings.filterwarnings("ignore")
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-OUT_DIR = REPO_ROOT / "outputs"
-FIG_DIR = OUT_DIR / "figures"
+from src.audit.claims import efficiency_front_load, run_audit  # noqa: E402
+from src.causal.synthetic_control import fit_synthetic, outcome_matrix, placebo_test  # noqa: E402
+from src.data.loader import MANIFEST_PATH, load_panel, refresh_from_owid  # noqa: E402
+from src.decoupling.classifier import annual_states, find_spells, income_groups, spell_survival  # noqa: E402
+from src.kaya.decomposition import EFFECTS, chain_lmdi, driver_stability, endpoint_lmdi  # noqa: E402
 
-# Colour palette consistent across all figures
-CLUSTER_COLORS = {0: "#e76f51", 1: "#264653", 2: "#2a9d8f"}
-STATE_COLORS = {
-    "absolute_decoupling": "#2a9d8f",
-    "relative_decoupling": "#e9c46a",
-    "no_decoupling": "#e76f51",
-    "degrowth_reduction": "#264653",
-    "unclear": "#adb5bd",
-}
+OUT = ROOT / "outputs"
+FIG = OUT / "figures"
+# Well-known policy dates picked by the analyst. Japan 2011 is a positive control: a large known shock.
+CASES = [("GBR", 2013, "UK Carbon Price Support (Apr 2013)"), ("AUS", 2012, "Australia carbon price (Jul 2012)"),
+         ("IRL", 2010, "Ireland carbon tax (2010)"), ("JPN", 2011, "Japan nuclear shutdowns after Fukushima (2011, positive control)")]
 
 
-# ── Figure 1: The Decoupling Scorecard ──────────────────────────────────────
-
-def fig_decoupling_scorecard(dc: pd.DataFrame):
-    fig, ax = plt.subplots(figsize=(11, 5.5))
-    decade_cols = ["decade_1990_2000", "decade_2000_2010", "decade_2010_2022"]
-    decade_labels = ["1990–2000", "2000–2010", "2010–2022"]
-    state_order = ["absolute_decoupling", "relative_decoupling", "no_decoupling", "degrowth_reduction", "unclear"]
-    x = np.arange(len(decade_labels))
-    width = 0.15
-    for i, state in enumerate(state_order):
-        counts = [dc[d].eq(state).sum() for d in decade_cols]
-        bars = ax.bar(x + (i - 2) * width, counts, width,
-                      label=state.replace("_", " ").title(), color=STATE_COLORS[state])
-    ax.set_xticks(x)
-    ax.set_xticklabels(decade_labels)
-    ax.set_ylabel("Number of countries")
-    ax.set_title("Has the world decoupled prosperity from carbon?\nCountry-level status by decade (n=154 countries)")
-    ax.legend(fontsize=7, ncol=2)
-    fig.tight_layout()
-    fig.savefig(FIG_DIR / "decoupling_scorecard.png", dpi=140)
-    plt.close(fig)
-
-
-# ── Figure 2: Kaya Waterfalls for selected countries ────────────────────────
-
-def fig_kaya_waterfalls(decomp: pd.DataFrame):
-    showcase = ["DEU", "GBR", "DNK", "UKR", "CHN", "USA", "IND", "SWE", "FRA", "AUT"]
-    showcase = [iso for iso in showcase if iso in decomp["iso_code"].values]
+def synthetic_results(panel: pd.DataFrame, fast: bool) -> list:
+    Y = outcome_matrix(panel, "co2_per_energy")
     rows = []
-    for iso in showcase:
-        r = decomp[decomp["iso_code"] == iso].iloc[0]
-        rows.append(r)
-
-    fig, axes = plt.subplots(2, 5, figsize=(15, 7.5), sharey=False)
-    axes = axes.flatten()
-
-    for ax, (_, r) in zip(axes, pd.DataFrame(rows).iterrows()):
-        drivers = {
-            "Population": r["delta_population"],
-            "Affluence": r["delta_affluence"],
-            "Efficiency": r["delta_intensity"],
-            "Fuel Mix": r["delta_carbon_mix"],
-        }
-        colors = ["#e76f51" if v > 0 else "#2a9d8f" for v in drivers.values()]
-        bars = ax.bar(list(drivers.keys()), list(drivers.values()), color=colors, width=0.7)
-        ax.axhline(0, color="black", lw=0.8)
-        ax.set_title(f"{r['country']}\n{r['co2_pct_change']:+.1f}% total", fontsize=9)
-        ax.tick_params(axis='x', labelsize=7, rotation=30)
-        ax.set_ylabel("Mt CO₂" if _ == 0 else "")
-
-    red_patch = mpatches.Patch(color="#e76f51", label="CO₂ increasing factor")
-    green_patch = mpatches.Patch(color="#2a9d8f", label="CO₂ reducing factor")
-    fig.legend(handles=[red_patch, green_patch], loc="upper right", fontsize=9)
-    fig.suptitle("Kaya Identity Decomposition: WHERE did each country's CO₂ change come from? (1990→2022)", fontsize=11)
-    fig.tight_layout()
-    fig.savefig(FIG_DIR / "kaya_waterfalls.png", dpi=140)
-    plt.close(fig)
+    for iso, year, label in CASES:
+        if fast:
+            fit = fit_synthetic(Y, iso, year)
+            res = {"fit": fit, "p_value_gap": float("nan"), "n_placebos": 0, "standardised_gap": fit.mean_post_gap / max(fit.pre_rmspe, 1e-9)}
+        else:
+            res = placebo_test(Y, iso, year)
+        rows.append({"iso": iso, "year": year, "label": label, "effect_pct": float(np.expm1(res["fit"].mean_post_gap) * 100),
+                     "pre_rmspe": res["fit"].pre_rmspe, "std_gap": res["standardised_gap"], "p_value": res["p_value_gap"],
+                     "n_placebos": res["n_placebos"], "fit": res["fit"]})
+    return rows
 
 
-# ── Figure 3: Trajectory clusters ───────────────────────────────────────────
-
-def fig_trajectory_clusters(panel: pd.DataFrame, cluster_result: pd.DataFrame, medians: pd.DataFrame):
-    wide = build_trajectory_matrix(panel)
-    years = [y for y in range(1990, 2023) if y in wide.columns]
-
-    cluster_labels = {
-        0: "Collapse-then-plateau (incl. post-Soviet)",
-        1: "Rapid growth (developing world)",
-        2: "Peak-and-decline (rich-world transition)",
-    }
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
-
-    ax = axes[0]
-    for _, row in cluster_result.iterrows():
-        if row["iso_code"] not in wide.index:
-            continue
-        traj = wide.loc[row["iso_code"], years].values.astype(float)
-        ax.plot(years, traj, alpha=0.12, color=CLUSTER_COLORS.get(row["cluster"], "grey"), lw=0.7)
-    for c, label in cluster_labels.items():
-        med = medians.loc[c, years].values if c in medians.index else None
-        if med is not None:
-            ax.plot(years, med, lw=2.5, color=CLUSTER_COLORS[c], label=f"C{c}: {label}")
-    ax.axhline(1.0, color="black", ls="--", lw=0.8, label="1990 baseline")
-    ax.set_ylabel("CO₂/cap index (1990=1.0)")
-    ax.set_title("All countries — individual trajectories by cluster")
-    ax.legend(fontsize=7, loc="upper left")
-
-    # Highlight specific country trajectories
-    ax2 = axes[1]
-    highlight = {
-        "DEU": ("#e76f51", "Germany"),
-        "GBR": ("#2a9d8f", "United Kingdom"),
-        "DNK": ("#264653", "Denmark"),
-        "UKR": ("#f4a261", "Ukraine"),
-        "CHN": ("#a8c5da", "China"),
-        "SWE": ("#81b29a", "Sweden"),
-        "AUT": ("#e07a5f", "Austria"),
-    }
-    for iso, (color, label) in highlight.items():
-        if iso in wide.index:
-            traj = wide.loc[iso, years].values.astype(float)
-            ax2.plot(years, traj, lw=2.0, color=color, label=label)
-    ax2.axhline(1.0, color="black", ls="--", lw=0.8)
-    ax2.set_title("Country spotlight — the clustering reveal")
-    ax2.set_ylabel("CO₂/cap index (1990=1.0)")
-    ax2.legend(fontsize=8)
-
-    fig.suptitle("CO₂ per capita trajectories (1990=1.0)\nGermany and Ukraine cluster together — not with Denmark and Sweden", fontsize=10)
-    fig.tight_layout()
-    fig.savefig(FIG_DIR / "trajectory_clusters.png", dpi=140)
-    plt.close(fig)
-
-
-# ── Figure 4: Absolute decoupling consistency ────────────────────────────────
-
-def fig_decoupling_consistency(dc: pd.DataFrame, panel: pd.DataFrame):
-    truly_rich = dc[(dc["currently_absolute_2018_2022"]) &
-                    (dc["co2_per_cap_change_pct"] < 0) &
-                    (dc["gdp_per_cap_growth_pct"] > 15)].copy()
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
-
-    # Left: longest consecutive absolute decoupling run vs CO2 reduction
-    ax = axes[0]
-    ax.scatter(truly_rich["longest_consecutive_abs_run"],
-               truly_rich["co2_per_cap_change_pct"],
-               c=truly_rich["suspect_offshoring"].map({True: "#e76f51", False: "#2a9d8f"}),
-               s=60, alpha=0.8)
-    for _, r in truly_rich.iterrows():
-        if r["country"] in ["Germany", "United Kingdom", "Denmark", "Sweden", "France",
-                             "Austria", "Norway", "Switzerland", "United States", "Singapore"]:
-            ax.annotate(r["country"], (r["longest_consecutive_abs_run"], r["co2_per_cap_change_pct"]),
-                        fontsize=7, ha="left", va="bottom",
-                        xytext=(3, 3), textcoords="offset points")
-    ax.set_xlabel("Longest CONSECUTIVE years of absolute decoupling")
-    ax.set_ylabel("Total CO₂/cap change 1990–2022 (%)")
-    ax.set_title("How SUSTAINED is absolute decoupling?\n(red = suspect offshoring flag)")
-    ax.axhline(0, color="black", lw=0.5)
-
-    red_p = mpatches.Patch(color="#e76f51", label="Suspect offshoring")
-    green_p = mpatches.Patch(color="#2a9d8f", label="Not flagged")
-    ax.legend(handles=[red_p, green_p], fontsize=8)
-
-    # Right: fuel switching vs energy efficiency contributions for key countries
-    ax2 = axes[1]
-    key_isos = ["DEU", "GBR", "DNK", "SWE", "FRA", "AUT", "CHE", "NOR", "USA", "JPN", "ESP", "ITA"]
-    showcase_decomp = decomp_global[decomp_global["iso_code"].isin(key_isos)].copy()
-    # Plot absolute Mt contributions
-    ax2.scatter(showcase_decomp["delta_intensity"], showcase_decomp["delta_carbon_mix"],
-                s=80, color="#264653", alpha=0.9)
-    for _, r in showcase_decomp.iterrows():
-        ax2.annotate(r["country"][:8], (r["delta_intensity"], r["delta_carbon_mix"]),
-                     fontsize=7, xytext=(3, 3), textcoords="offset points")
-    ax2.axhline(0, color="black", lw=0.5); ax2.axvline(0, color="black", lw=0.5)
-    ax2.set_xlabel("Energy efficiency contribution (Mt CO₂)")
-    ax2.set_ylabel("Fuel switch contribution (Mt CO₂)")
-    ax2.set_title("Efficiency vs. fuel switching:\nhow did decarbonizers actually reduce emissions?")
-    ax2.annotate("← more efficiency\n     reduction", xy=(-80, 5), fontsize=7, color="grey")
-    ax2.annotate("↓ more fuel\n  switching", xy=(5, -80), fontsize=7, color="grey", rotation=0)
-
-    fig.tight_layout()
-    fig.savefig(FIG_DIR / "decoupling_consistency.png", dpi=140)
-    plt.close(fig)
+def build_report(r: dict) -> str:
+    c = {x["id"]: x for x in r["claims"]}
+    c1, c2, c3, c4, c5 = (c[k]["evidence"] for k in ["C1", "C2", "C3", "C4", "C5"])
+    surv = r["survival"]
+    L = ["# CO2 Trace: audited carbon accounting, 1990-2022", "",
+         f"Data: committed OWID snapshot, {c5['countries_in_panel']} countries (manifest sha256 `{r['sha256'][:12]}`). "
+         "Every number below is computed by `python -m scripts.run_analysis`; none is typed by hand.", "",
+         "## 1. Audit of the v1 report", "", "| # | v1 claim | verdict |", "|---|---|---|"]
+    L += [f"| {x['id']} | {x['v1_claim']} | **{x['verdict']}** |" for x in r["claims"]]
+    L += ["", "### C1: Germany and Ukraine",
+          f"On the RMS distance between log-trajectories (1990 = 1), Germany is {c1['distance_ukraine']:.2f} from Ukraine, "
+          f"{c1['distance_denmark']:.2f} from Denmark and {c1['distance_sweden']:.2f} from Sweden. Under a moving-block bootstrap over years "
+          f"(k = {c1['k']}), Germany is co-clustered with Denmark in {c1['co_assign_denmark']:.0%} of draws, with Sweden in "
+          f"{c1['co_assign_sweden']:.0%}, and with Ukraine in {c1['co_assign_ukraine']:.0%}. The v1 K-means run did put Germany and Ukraine "
+          f"together, but Germany's nearest centre was only {c1['v1_centre_margin_pct']:.0f}% closer than the next, so the assignment was a boundary case, "
+          f"and {c1['n_excluded_low_base']} near-zero emitters were excluded here because their 1990-based ratios are not meaningful.", "",
+          "### C2: efficiency versus fuel switching",
+          f"Of {c2['n_reducers']} countries whose CO2 fell, {c2['efficiency_led_share']:.0%} had efficiency as their larger reducing effect; "
+          f"{c2['p05']:.0%} to {c2['p95']:.0%} under 3% log-normal noise on all inputs. This is a sensitivity range, not a sampling confidence interval.", "",
+          "### C3: how long does absolute decoupling last?",
+          f"Strictly consecutive strong-decoupling spells: {c3['strict_spells']}, median length {c3['strict_median_length']:.0f} year, "
+          f"{c3['strict_share_one_year']:.0%} last a single year, longest {c3['strict_longest_years']} years. Allowing one interrupted year, the longest "
+          f"spell becomes {c3['tolerant_longest_years']} years. The claim holds only under the strict definition.", "",
+          "### C4: the offshoring flag",
+          f"{c4['n_flagged']} of {c4['n_countries']} countries meet the v1 rule (energy intensity down more than 30%, carbon intensity of energy down less than 10%). "
+          f"{c4['n_flagged_with_rising_co2_per_capita']} of them ({c4['share_rising']:.0%}) have rising CO2 per capita and a median GDP per capita growth of "
+          f"{c4['median_gdp_per_capita_growth_pct_flagged']:.0f}%: fast growth lowers energy per GDP mechanically. The flag does not isolate offshoring and is not used here.", "",
+          "### C5: coverage",
+          f"The panel has {c5['countries_in_panel']} countries; {c5['countries_in_endpoint_decomposition']} have positive values at both endpoints and "
+          f"{c5['countries_in_chain_decomposition']} in every year, so the chain-linked decomposition covers the smaller set.", "",
+          "## 2. Where emissions changed: chain-linked LMDI", "",
+          "Year-by-year LMDI closes exactly (largest residual "
+          f"{r['max_residual']:.1e} Mt). Its totals differ from the two-endpoint version because each year is weighted by that year's emissions. The eight largest differences:", "",
+          "| Country | Efficiency, endpoint (Mt) | Efficiency, chain (Mt) | Difference (Mt) |", "|---|---|---|---|"]
+    L += [f"| {x.country} | {x.endpoint:+.0f} | {x.chain:+.0f} | {x.diff:+.0f} |" for x in r["path_gap"].head(8).itertuples()]
+    L += ["", f"For large reducers, the share of the cumulative efficiency effect that fell in 1991-1998: "
+          + ", ".join(f"{x.country} {x.early_share:.0%}" for x in r["front"].head(5).itertuples())
+          + f"; for comparison United Kingdom {r['front'].set_index('iso_code').loc['GBR','early_share']:.0%}. "
+          "A front-loaded efficiency effect is consistent with transition-era restructuring, but this panel has no sector split and cannot separate it from technology.", "",
+          "## 3. Do decoupling spells last? Survival analysis", "",
+          f"{surv['n_spells']} strong-decoupling spells, right-censored where a spell was still running in 2022. "
+          f"Kaplan-Meier survival past one year: high-income {r['km1']['high']:.0%}, middle {r['km1']['middle']:.0%}, low {r['km1']['low']:.0%} (1990 GDP per capita tertiles). "
+          f"Log-rank high vs low: chi2 = {surv['logrank_high_vs_low']['chi2']:.1f}, p = {surv['logrank_high_vs_low']['p_value']:.4f}.", "",
+          "## 4. Synthetic control: what can and cannot be said", "",
+          "Outcome: log carbon intensity of energy. Donors: the 15 countries closest before the policy, weights on the probability simplex, fit scored on the last five pre-policy years. "
+          "Cases and years are well-known policy dates picked by the analyst; point estimates were seen before this report was written, so inference is exploratory. "
+          "p-values rank the standardised post-policy gap among in-space placebos.", "",
+          "| Case | Effect vs synthetic | Held-out pre-fit RMSPE | Placebo p |", "|---|---|---|---|"]
+    L += [f"| {x['label']} | {x['effect_pct']:+.1f}% | {x['pre_rmspe']:.3f} | {('n/a' if np.isnan(x['p_value']) else format(x['p_value'], '.2f'))} |" for x in r["synthetic"]]
+    L += ["", "Japan 2011 is a positive control: a large, known increase in carbon intensity. If the test cannot flag that at conventional levels, it has low power here, "
+          "and a non-significant UK, Australian or Irish estimate is not evidence of no effect.", "",
+          "## Limitations", "",
+          "- CO2 is territorial; consumption-based emissions and trade flows are not in the panel.",
+          "- Kaya LMDI is accounting. Efficiency mixes technology, structure and offshoring.",
+          "- Spell and distance results depend on stated definitions (strict spells, 4x winsorisation, k chosen by silhouette).",
+          "- Synthetic control is exploratory: few treated units, short pre-periods, and EU donors share common policy shocks.", ""]
+    return "\n".join(L)
 
 
-# ── Figure 5: The Renewables Acceleration ────────────────────────────────────
+def make_figures(r: dict) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    FIG.mkdir(parents=True, exist_ok=True)
 
-def fig_renewables_transition(panel: pd.DataFrame):
-    key_countries = {
-        "DEU": "Germany", "GBR": "United Kingdom", "DNK": "Denmark",
-        "SWE": "Sweden", "FRA": "France", "USA": "United States",
-        "CHN": "China", "IND": "India",
-    }
-    fig, ax = plt.subplots(figsize=(11, 5.5))
-    for iso, label in key_countries.items():
-        sub = panel[(panel["iso_code"] == iso) & panel["renewables_share_energy"].notna()].sort_values("year")
-        if not sub.empty:
-            color = "#2a9d8f" if iso in ("DEU","GBR","DNK","SWE","FRA") else "#e76f51" if iso in ("CHN","IND") else "#264653"
-            ax.plot(sub["year"], sub["renewables_share_energy"], lw=2.0, label=label, color=color)
-    ax.set_xlabel("Year"); ax.set_ylabel("Renewables share of primary energy (%)")
-    ax.set_title("Renewable energy share 1990–2022\nSpoiler: most countries started very low and some barely moved")
-    ax.legend(fontsize=8, ncol=2)
-    fig.tight_layout()
-    fig.savefig(FIG_DIR / "renewables_transition.png", dpi=140)
-    plt.close(fig)
+    t = r["claims"][0]["table"]
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    ax[0].barh(t["peer"], t["distance"], color="#264653"); ax[0].set_title("Distance from Germany (log-trajectory RMS)"); ax[0].invert_yaxis()
+    ax[1].barh(t["peer"], t["co_assignment"], color="#2a9d8f"); ax[1].set_xlim(0, 1.05); ax[1].set_title("Bootstrap co-assignment with Germany"); ax[1].invert_yaxis()
+    fig.tight_layout(); fig.savefig(FIG / "claim_germany_ukraine.png", dpi=140); plt.close(fig)
 
+    g = r["path_gap"].head(8)
+    fig, ax = plt.subplots(figsize=(8, 4.5)); y = np.arange(len(g))
+    ax.barh(y - 0.2, g["endpoint"], 0.4, label="endpoint", color="#e76f51"); ax.barh(y + 0.2, g["chain"], 0.4, label="chain-linked", color="#264653")
+    ax.set_yticks(y); ax.set_yticklabels(g["country"]); ax.invert_yaxis(); ax.set_xlabel("Efficiency effect, Mt CO2"); ax.legend(); ax.set_title("Endpoint LMDI hides path dependence")
+    fig.tight_layout(); fig.savefig(FIG / "chain_vs_endpoint.png", dpi=140); plt.close(fig)
 
-# ── Build report ─────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for grp, color in [("high", "#264653"), ("middle", "#e9c46a"), ("low", "#e76f51")]:
+        c = r["survival"]["curves"][grp]; ax.step(c["t"], c["survival"], where="post", label=f"{grp} income", color=color)
+    ax.set_xlabel("Years in strong decoupling"); ax.set_ylabel("Share of spells surviving"); ax.legend(); ax.set_title("Decoupling spells are short (Kaplan-Meier, censored)")
+    fig.tight_layout(); fig.savefig(FIG / "spell_survival.png", dpi=140); plt.close(fig)
 
-def build_report(panel, decomp, dc, cluster_result, n_k):
-    n_countries = panel["iso_code"].nunique()
-    reducers = decomp[decomp["co2_change_mt"] < 0]
-    abs_dec_now = dc[dc["currently_absolute_2018_2022"]]
-    suspect_off = dc[dc["suspect_offshoring"]]
-
-    cluster_0 = cluster_result[cluster_result["cluster"] == 0]["country"].tolist()
-    cluster_2 = cluster_result[cluster_result["cluster"] == 2]["country"].tolist()
-
-    deu_decomp = decomp[decomp["iso_code"] == "DEU"].iloc[0]
-    ukr_decomp = decomp[decomp["iso_code"] == "UKR"].iloc[0]
-    gbr_decomp = decomp[decomp["iso_code"] == "GBR"].iloc[0]
-
-    lines = []
-    lines.append("# GreenTrace — Deconstructing the Global Energy Transition\n")
-    lines.append(f"**Source data:** Our World in Data (CC BY) — {n_countries} countries, 1990–2022.")
-    lines.append(f"**Data download date:** Live at runtime from raw.githubusercontent.com/owid\n")
-
-    lines.append("## The Central Finding\n")
-    lines.append("> **Of the 39 countries that reduced absolute CO₂ emissions between 1990 and 2022, the majority achieved this primarily through energy efficiency gains and economic restructuring — not through fuel switching to clean energy. Only a minority achieved reductions primarily driven by replacing fossil fuels with renewables or nuclear.**\n")
-
-    lines.append("## Finding 1: Germany and Ukraine cluster together — not with Denmark and Sweden\n")
-    lines.append(f"Unsupervised K-means clustering on CO₂/capita trajectory SHAPES (1990=1.0) finds {n_k} natural groups:")
-    lines.append(f"- **Cluster 0 (collapse-then-plateau, {len(cluster_0)} countries):** sharp early drop, flat or modest subsequent decline. Includes: Germany, Ukraine, Estonia, Latvia, Lithuania, Romania, Czechia, Bulgaria — i.e. post-Soviet deindustrialisation AND Western European 'Energiewende' in the same cluster.")
-    lines.append(f"- **Cluster 2 (peak-and-decline, {len(cluster_2)} countries):** rose through the 2000s, peaked, then declined. Includes UK, Denmark, Sweden, France, Austria, Switzerland, USA.")
-    lines.append(f"- **What this means:** Germany's trajectory shape is statistically closer to Ukraine's economic collapse than to Denmark's deliberate clean-energy transition. The CO₂ absolute numbers look similar but the mechanisms are fundamentally different. The Kaya decomposition makes this explicit.\n")
-
-    lines.append("## Finding 2: The Kaya Decomposition reveals the drivers\n")
-    lines.append("_(Negative values = CO₂-reducing contribution; positive = CO₂-increasing)_\n")
-    lines.append("| Country | Net change | Fuel switch (Mt) | Efficiency (Mt) | Affluence (Mt) | Population (Mt) |")
-    lines.append("|---|---|---|---|---|---|")
-    for _, r in decomp[decomp["iso_code"].isin(["DEU","GBR","DNK","SWE","FRA","AUT","UKR","USA","CHN"])].iterrows():
-        lines.append(f"| {r['country']} | {r['co2_pct_change']:+.1f}% | {r['delta_carbon_mix']:+.1f} | {r['delta_intensity']:+.1f} | {r['delta_affluence']:+.1f} | {r['delta_population']:+.1f} |")
-    lines.append("")
-    lines.append(f"**Germany interpretation:** efficiency gains (−{abs(deu_decomp['delta_intensity']):.0f} Mt) and fuel switching (−{abs(deu_decomp['delta_carbon_mix']):.0f} Mt) overcame affluence growth (+{deu_decomp['delta_affluence']:.0f} Mt). But efficiency here captures both genuine productivity improvements AND deindustrialisation — two very different processes with the same Kaya signature.")
-    gbr_dom = "efficiency" if abs(gbr_decomp["delta_intensity"]) > abs(gbr_decomp["delta_carbon_mix"]) else "fuel switching"
-    lines.append(f"**UK interpretation:** efficiency (−{abs(gbr_decomp['delta_intensity']):.0f} Mt) is actually the larger term, with fuel switching (−{abs(gbr_decomp['delta_carbon_mix']):.0f} Mt) second — the same efficiency/deindustrialisation ambiguity flagged for Germany applies here too, since the UK's manufacturing base also shrank over this period. What IS more confidently attributable to deliberate policy is the fuel-switching component specifically: carbon-intensity-of-energy is less confounded by economic restructuring than energy-intensity-of-GDP is, so the coal-closure-and-offshore-wind story is real, just smaller in Mt terms than the headline 'efficiency' number.")
-    lines.append(f"**Ukraine interpretation:** efficiency component (−{abs(ukr_decomp['delta_intensity']):.0f} Mt) reflects industrial collapse, not technological progress. Framing this as 'decarbonisation' would be misleading.\n")
-
-    lines.append("## Finding 3: Absolute decoupling is real but almost never sustained\n")
-    lines.append(f"- Countries currently in absolute decoupling (GDP/cap rising, CO₂/cap falling, 2018–2022): **{len(abs_dec_now)}**")
-    streak_min, streak_max = int(abs_dec_now["longest_consecutive_abs_run"].min()), int(abs_dec_now["longest_consecutive_abs_run"].max())
-    lines.append(f"- Of these, the longest consecutive streak of absolute decoupling ranges {streak_min}–{streak_max} years — not sustained throughout the 32-year window.")
-    streak_isos = {"SWE": "Sweden", "DEU": "Germany", "DNK": "Denmark", "GBR": "UK"}
-    streak_parts = []
-    for iso, label in streak_isos.items():
-        row = dc[dc["iso_code"] == iso]
-        if not row.empty:
-            streak_parts.append(f"{label}: {int(row.iloc[0]['longest_consecutive_abs_run'])}")
-    lines.append("- Longest consecutive absolute-decoupling streak so far — " + ". ".join(streak_parts) + ".")
-    lines.append("- Every country that shows net CO₂ reduction also shows periods of re-coupling — growth booms typically increase CO₂ even in 'green' economies.\n")
-
-    lines.append("## Finding 4: The offshoring ambiguity\n")
-    lines.append(f"- {len(suspect_off)} of 162 countries are flagged as **suspect offshoring**: energy intensity fell >30% while carbon intensity of energy barely changed (<10%).")
-    lines.append("- Signature: a service-sector economy increasingly importing manufactured goods from high-emission countries. The country's *territorial* CO₂ falls but its *consumption-based* footprint may not.")
-    lines.append("- Flagged countries include: Lithuania, Italy, New Zealand, Canada, Norway, Cyprus, UAE, and others.")
-    lines.append("- This is not a conclusion — the OWID data does not have consumption-based emissions for all countries — but it is a directional diagnostic worth investigating.\n")
-
-    lines.append("## Limitations (honest)\n")
-    lines.append("- CO₂ is territorial (production-based), not consumption-based. A country that moved manufacturing abroad looks better than it really is.")
-    lines.append("- Kaya decomposition is accounting, not causal — it does not explain *why* energy intensity fell, only that it did.")
-    lines.append("- The 'suspect offshoring' flag is heuristic (no structural break test, no trade flow validation).")
-    lines.append("- Clustering is on trajectory shape, not mechanism — two countries can have the same shape for entirely different reasons.\n")
-
-    return "\n".join(lines)
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7)); Y = r["outcomes"]
+    for ax, x in zip(axes.ravel(), r["synthetic"]):
+        f = x["fit"]; actual = np.exp(Y[x["iso"]]); synth = np.exp(Y[x["iso"]] - f.gap)
+        ax.plot(actual.index, actual, color="#264653", label=x["iso"]); ax.plot(synth.index, synth, "--", color="#e76f51", label="synthetic")
+        ax.axvline(x["year"], color="grey", lw=0.8); ax.set_title(x["label"], fontsize=9); ax.legend(fontsize=8)
+    fig.suptitle("Carbon intensity of energy (t CO2 per MWh)"); fig.tight_layout(); fig.savefig(FIG / "synthetic_control.png", dpi=140); plt.close(fig)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def main(argv=None) -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--refresh", action="store_true", help="re-download OWID data and rewrite the manifest")
+    ap.add_argument("--fast", action="store_true", help="skip placebo inference and use fewer draws")
+    args = ap.parse_args(argv)
 
-def main():
-    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    panel = refresh_from_owid() if args.refresh else load_panel()
+    OUT.mkdir(exist_ok=True); (OUT / "tables").mkdir(exist_ok=True)
+    sha = json.loads(MANIFEST_PATH.read_text())["sha256"]
 
-    print("Loading data...")
-    co2_raw, energy_raw = load_raw()
-    panel = build_panel(co2_raw, energy_raw)
-    panel.to_csv(REPO_ROOT / "data" / "panel.csv", index=False)
+    claims = run_audit(panel, n_boot=60 if args.fast else 200)
+    chain, endpoint = chain_lmdi(panel), endpoint_lmdi(panel)
+    tot = chain.groupby("iso_code")[EFFECTS].sum()
+    gap = endpoint.set_index("iso_code").join(tot, rsuffix="_chain", how="inner")
+    names = panel[["iso_code", "country"]].drop_duplicates().set_index("iso_code")["country"]
+    gap = pd.DataFrame({"country": names.reindex(gap.index), "endpoint": gap["delta_intensity"], "chain": gap["delta_intensity_chain"]})
+    gap["diff"] = gap["chain"] - gap["endpoint"]
+    gap = gap.reindex(gap["diff"].abs().sort_values(ascending=False).index).reset_index()
 
-    print("Running Kaya decomposition...")
-    global decomp_global
-    decomp_global = decompose_all(panel)
+    spells = find_spells(annual_states(panel))
+    survival = spell_survival(spells, income_groups(panel))
+    km1 = {g: float(c.loc[c["t"] == 1, "survival"].iloc[0]) for g, c in survival["curves"].items()}
+    stab = driver_stability(panel, n_draws=60 if args.fast else 300)
+    front = efficiency_front_load(panel)
+    synthetic = synthetic_results(panel, args.fast)
+    results = {"claims": claims, "sha256": sha, "path_gap": gap, "front": front, "survival": survival, "km1": km1,
+               "synthetic": synthetic, "outcomes": outcome_matrix(panel, "co2_per_energy"),
+               "max_residual": float(max(chain["residual"].abs().max(), endpoint["residual"].abs().max()))}
 
-    print("Running decoupling classification...")
-    dc = classify_all(panel)
-
-    print("Running trajectory clustering...")
-    cluster_result, medians, n_k = cluster_trajectories(panel)
-
-    print("Generating figures...")
-    fig_decoupling_scorecard(dc)
-    fig_kaya_waterfalls(decomp_global)
-    fig_trajectory_clusters(panel, cluster_result, medians)
-    fig_decoupling_consistency(dc, panel)
-    fig_renewables_transition(panel)
-
-    print("Writing report...")
-    report = build_report(panel, decomp_global, dc, cluster_result, n_k)
-    (OUT_DIR / "analysis_report.md").write_text(report, encoding="utf-8")
-
-    print("\nDone.")
-    for f in sorted(FIG_DIR.glob("*.png")):
-        print(" -", f)
-    print(" -", OUT_DIR / "analysis_report.md")
+    (OUT / "analysis_report.md").write_text(build_report(results), encoding="utf-8")
+    (OUT / "claims.json").write_text(json.dumps([{k: v for k, v in x.items() if k != "table"} for x in claims], indent=2, default=float) + "\n")
+    stab.to_csv(OUT / "tables" / "kaya_driver_stability.csv", index=False); gap.to_csv(OUT / "tables" / "kaya_chain_vs_endpoint.csv", index=False)
+    front.to_csv(OUT / "tables" / "efficiency_front_load.csv", index=False); spells.to_csv(OUT / "tables" / "decoupling_spells.csv", index=False)
+    pd.DataFrame([{k: v for k, v in s.items() if k != "fit"} for s in synthetic]).to_csv(OUT / "tables" / "synthetic_control.csv", index=False)
+    make_figures(results)
+    print("Wrote", OUT / "analysis_report.md")
 
 
 if __name__ == "__main__":

@@ -1,56 +1,69 @@
-# GreenTrace — Deconstructing the Global Energy Transition
+# CO2 Trace: audited carbon accounting, 1990-2022
 
-**Source data:** Our World in Data (CC BY) — 162 countries, 1990–2022.
-**Data download date:** Live at runtime from raw.githubusercontent.com/owid
+Data: committed OWID snapshot, 162 countries (manifest sha256 `2b29d86f403e`). Every number below is computed by `python -m scripts.run_analysis`; none is typed by hand.
 
-## The Central Finding
+## 1. Audit of the v1 report
 
-> **Of the 39 countries that reduced absolute CO₂ emissions between 1990 and 2022, the majority achieved this primarily through energy efficiency gains and economic restructuring — not through fuel switching to clean energy. Only a minority achieved reductions primarily driven by replacing fossil fuels with renewables or nuclear.**
+| # | v1 claim | verdict |
+|---|---|---|
+| C1 | Germany clusters with Ukraine, not with Denmark and Sweden. | **not supported** |
+| C2 | Most countries that cut CO2 did so mainly through efficiency, not fuel switching. | **supported** |
+| C3 | Absolute decoupling is real but never sustained (longest run 7 years). | **definition-sensitive** |
+| C4 | 41 countries show the signature of offshoring. | **misleading** |
+| C5 | The decomposition covers all 162 countries. | **denominator differs** |
 
-## Finding 1: Germany and Ukraine cluster together — not with Denmark and Sweden
+### C1: Germany and Ukraine
+On the RMS distance between log-trajectories (1990 = 1), Germany is 0.53 from Ukraine, 0.21 from Denmark and 0.11 from Sweden. Under a moving-block bootstrap over years (k = 3), Germany is co-clustered with Denmark in 100% of draws, with Sweden in 100%, and with Ukraine in 46%. The v1 K-means run did put Germany and Ukraine together, but Germany's nearest centre was only 7% closer than the next, so the assignment was a boundary case, and 16 near-zero emitters were excluded here because their 1990-based ratios are not meaningful.
 
-Unsupervised K-means clustering on CO₂/capita trajectory SHAPES (1990=1.0) finds 3 natural groups:
-- **Cluster 0 (collapse-then-plateau, 27 countries):** sharp early drop, flat or modest subsequent decline. Includes: Germany, Ukraine, Estonia, Latvia, Lithuania, Romania, Czechia, Bulgaria — i.e. post-Soviet deindustrialisation AND Western European 'Energiewende' in the same cluster.
-- **Cluster 2 (peak-and-decline, 44 countries):** rose through the 2000s, peaked, then declined. Includes UK, Denmark, Sweden, France, Austria, Switzerland, USA.
-- **What this means:** Germany's trajectory shape is statistically closer to Ukraine's economic collapse than to Denmark's deliberate clean-energy transition. The CO₂ absolute numbers look similar but the mechanisms are fundamentally different. The Kaya decomposition makes this explicit.
+### C2: efficiency versus fuel switching
+Of 39 countries whose CO2 fell, 82% had efficiency as their larger reducing effect; 78% to 85% under 3% log-normal noise on all inputs. This is a sensitivity range, not a sampling confidence interval.
 
-## Finding 2: The Kaya Decomposition reveals the drivers
+### C3: how long does absolute decoupling last?
+Strictly consecutive strong-decoupling spells: 1036, median length 1 year, 70% last a single year, longest 7 years. Allowing one interrupted year, the longest spell becomes 16 years. The claim holds only under the strict definition.
 
-_(Negative values = CO₂-reducing contribution; positive = CO₂-increasing)_
+### C4: the offshoring flag
+41 of 162 countries meet the v1 rule (energy intensity down more than 30%, carbon intensity of energy down less than 10%). 24 of them (59%) have rising CO2 per capita and a median GDP per capita growth of 131%: fast growth lowers energy per GDP mechanically. The flag does not isolate offshoring and is not used here.
 
-| Country | Net change | Fuel switch (Mt) | Efficiency (Mt) | Affluence (Mt) | Population (Mt) |
-|---|---|---|---|---|---|
-| Austria | -1.2% | -9.0 | -31.9 | +30.0 | +10.3 |
-| China | +371.6% | -1030.9 | -2088.6 | +11089.8 | +1258.0 |
-| Denmark | -45.6% | -22.8 | -28.9 | +21.8 | +5.5 |
-| France | -25.2% | -52.0 | -215.6 | +116.3 | +51.7 |
-| Germany | -36.7% | -223.2 | -724.7 | +515.7 | +45.3 |
-| Sweden | -36.7% | -19.4 | -34.9 | +23.9 | +9.4 |
-| Ukraine | -79.8% | +15.6 | -412.4 | -82.9 | -83.8 |
-| United Kingdom | -48.3% | -193.2 | -340.9 | +167.2 | +76.1 |
-| United States | -1.5% | -887.5 | -2985.5 | +2275.9 | +1520.8 |
+### C5: coverage
+The panel has 162 countries; 154 have positive values at both endpoints and 153 in every year, so the chain-linked decomposition covers the smaller set.
 
-**Germany interpretation:** efficiency gains (−725 Mt) and fuel switching (−223 Mt) overcame affluence growth (+516 Mt). But efficiency here captures both genuine productivity improvements AND deindustrialisation — two very different processes with the same Kaya signature.
-**UK interpretation:** efficiency (−341 Mt) is actually the larger term, with fuel switching (−193 Mt) second — the same efficiency/deindustrialisation ambiguity flagged for Germany applies here too, since the UK's manufacturing base also shrank over this period. What IS more confidently attributable to deliberate policy is the fuel-switching component specifically: carbon-intensity-of-energy is less confounded by economic restructuring than energy-intensity-of-GDP is, so the coal-closure-and-offshore-wind story is real, just smaller in Mt terms than the headline 'efficiency' number.
-**Ukraine interpretation:** efficiency component (−412 Mt) reflects industrial collapse, not technological progress. Framing this as 'decarbonisation' would be misleading.
+## 2. Where emissions changed: chain-linked LMDI
 
-## Finding 3: Absolute decoupling is real but almost never sustained
+Year-by-year LMDI closes exactly (largest residual 3.3e-11 Mt). Its totals differ from the two-endpoint version because each year is weighted by that year's emissions. The eight largest differences:
 
-- Countries currently in absolute decoupling (GDP/cap rising, CO₂/cap falling, 2018–2022): **57**
-- Of these, the longest consecutive streak of absolute decoupling ranges 2–7 years — not sustained throughout the 32-year window.
-- Longest consecutive absolute-decoupling streak so far — Sweden: 7. Germany: 4. Denmark: 4. UK: 7.
-- Every country that shows net CO₂ reduction also shows periods of re-coupling — growth booms typically increase CO₂ even in 'green' economies.
+| Country | Efficiency, endpoint (Mt) | Efficiency, chain (Mt) | Difference (Mt) |
+|---|---|---|---|
+| China | -2089 | -3312 | -1224 |
+| Russia | -1796 | -1276 | +520 |
+| United States | -2985 | -3291 | -305 |
+| India | -445 | -593 | -148 |
+| Kazakhstan | -270 | -165 | +105 |
+| Ukraine | -412 | -332 | +80 |
+| South Korea | -28 | -80 | -52 |
+| Japan | -318 | -362 | -44 |
 
-## Finding 4: The offshoring ambiguity
+For large reducers, the share of the cumulative efficiency effect that fell in 1991-1998: Germany 36%, Poland 34%, Romania 33%, Netherlands 27%, Czechia 26%; for comparison United Kingdom 16%. A front-loaded efficiency effect is consistent with transition-era restructuring, but this panel has no sector split and cannot separate it from technology.
 
-- 41 of 162 countries are flagged as **suspect offshoring**: energy intensity fell >30% while carbon intensity of energy barely changed (<10%).
-- Signature: a service-sector economy increasingly importing manufactured goods from high-emission countries. The country's *territorial* CO₂ falls but its *consumption-based* footprint may not.
-- Flagged countries include: Lithuania, Italy, New Zealand, Canada, Norway, Cyprus, UAE, and others.
-- This is not a conclusion — the OWID data does not have consumption-based emissions for all countries — but it is a directional diagnostic worth investigating.
+## 3. Do decoupling spells last? Survival analysis
 
-## Limitations (honest)
+1036 strong-decoupling spells, right-censored where a spell was still running in 2022. Kaplan-Meier survival past one year: high-income 42%, middle 31%, low 30% (1990 GDP per capita tertiles). Log-rank high vs low: chi2 = 11.9, p = 0.0005.
 
-- CO₂ is territorial (production-based), not consumption-based. A country that moved manufacturing abroad looks better than it really is.
-- Kaya decomposition is accounting, not causal — it does not explain *why* energy intensity fell, only that it did.
-- The 'suspect offshoring' flag is heuristic (no structural break test, no trade flow validation).
-- Clustering is on trajectory shape, not mechanism — two countries can have the same shape for entirely different reasons.
+## 4. Synthetic control: what can and cannot be said
+
+Outcome: log carbon intensity of energy. Donors: the 15 countries closest before the policy, weights on the probability simplex, fit scored on the last five pre-policy years. Cases and years are well-known policy dates picked by the analyst; point estimates were seen before this report was written, so inference is exploratory. p-values rank the standardised post-policy gap among in-space placebos.
+
+| Case | Effect vs synthetic | Held-out pre-fit RMSPE | Placebo p |
+|---|---|---|---|
+| UK Carbon Price Support (Apr 2013) | -9.2% | 0.049 | 0.25 |
+| Australia carbon price (Jul 2012) | -1.6% | 0.022 | 0.72 |
+| Ireland carbon tax (2010) | -1.9% | 0.037 | 0.78 |
+| Japan nuclear shutdowns after Fukushima (2011, positive control) | +14.5% | 0.026 | 0.10 |
+
+Japan 2011 is a positive control: a large, known increase in carbon intensity. If the test cannot flag that at conventional levels, it has low power here, and a non-significant UK, Australian or Irish estimate is not evidence of no effect.
+
+## Limitations
+
+- CO2 is territorial; consumption-based emissions and trade flows are not in the panel.
+- Kaya LMDI is accounting. Efficiency mixes technology, structure and offshoring.
+- Spell and distance results depend on stated definitions (strict spells, 4x winsorisation, k chosen by silhouette).
+- Synthetic control is exploratory: few treated units, short pre-periods, and EU donors share common policy shocks.
